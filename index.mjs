@@ -4,11 +4,21 @@ import cheerio from "cheerio"
 import async from "async"
 import levenshtein from "js-levenshtein"
 
+// Name of the station.
 const wfmu = "WFMU"
+// URL of the live stream.
 const wfmuLivestreamUrl = "http://stream0.wfmu.org/freeform-128k"
+// URL to a logo for the station. This is the only publicly accessible one I could find.
+// This will appear on Google Home Hub screens when the audio is playing.
 const stationLogoGifUrl = "https://www.wfmu.org/images/wfmu_logo_94.gif"
+// URL to the page where the most recent archives for the current shows are listed.
+// We read this on first run to get a full list of all the week's shows, but we use
+// the RSS XML feed thereafter to refresh it.
 const archivePageUrl = "https://wfmu.org/recentarchives.php"
+// URL to the feed for the most recent archives. Annoyingly, this only lists a fixed
+// number of links, and doesn't cover the whole week.
 const archiveFeedUrl = "http://wfmu.org/archivefeed/mp3.xml"
+// Base url of the station website.
 const wfmuBaseUrl = "http://wfmu.org"
 // Don't play any archive that's more than 30 days old, as the link has probably expired.
 const archiveAgeLimitMilliseconds = 30 * 24 * 60 * 60 * 1000
@@ -30,13 +40,22 @@ const defaultShows = {
 	wfmu: liveStreamShow,
 }
 
+// This is the current list of "known" archives.
 var archives = defaultShows
 
-async function fetchHtml(url) {
+// Simple function for reading the content of a site/feed.
+async function fetchContent(url) {
 	const { data } = await axios.get(url)
 	return cheerio.load(data)
 }
 
+// The Google Assistant API allows us to provide a list of "expected responses"
+// that it can use to voice-match against. Sadly, this only seems to work when
+// you ask the user a question. We don't want to have to do this (we want the
+// user to be able to trigger an archive "from cold" with one command). So our
+// best option is to just try and determine what archive name is closest to the
+// thing that the user asked for. I am simply using Levenshtein distance to
+// figure this out for now, and it seems to be working okay.
 function getBestMatchArchive(title) {
 	let best = null
 	let bestDistance = 10000
@@ -44,6 +63,10 @@ function getBestMatchArchive(title) {
 	Object.keys(archives).forEach((key) => {
 		const archive = archives[key]
 		let distance = levenshtein(title, key)
+		// TODO: Discard results if the Levenshtein distance is too great (for
+		// example, more than 60% of the length of the match string). This will
+		// require additional logic in the Actions Console, where we will ask
+		// the user to provide another archive name, or something.
 		if (distance < bestDistance) {
 			if (archive.dateFound && now - archive.dateFound > archiveAgeLimitMilliseconds) {
 				console.log(`Disregarding match '${archive.titleAnnounce}' as it is past the expiry date.`)
@@ -57,6 +80,9 @@ function getBestMatchArchive(title) {
 	return archives[best]
 }
 
+// There are certain shows with names that users might ask for "shorthand"
+// versions of. For each show title that we find, try to figure out any
+// possible synonyms.
 function getTitleSynonyms(title) {
 	title = title.toLowerCase()
 	title = title.replace(/"/g, "")
@@ -75,9 +101,12 @@ function getTitleSynonyms(title) {
 	return synonyms
 }
 
+// Adds the given show to the global list of known shows.
 async function applyShow(title, date, m3uLink, shows) {
-	const now = Date.now()
 	if (m3uLink && title && date) {
+		// We will have an M3U link from the site/rss, but we really
+		// want the MP3 link, which is inside the content of the M3U
+		// file.
 		const { data } = await axios.get(m3uLink)
 		const titleSynonyms = getTitleSynonyms(title)
 		const archive = {
@@ -85,15 +114,16 @@ async function applyShow(title, date, m3uLink, shows) {
 			description: "WFMU archive",
 			date: date,
 			mp3Link: data.trim(),
-			dateFound: now,
+			dateFound: Date.now(),
 		}
 		titleSynonyms.forEach((title) => (shows[title] = archive))
 	}
 }
 
+// Reads the list of archives from the HTML Recent Archives page.
 async function refreshArchiveListFromHtml(archivePageUrl) {
 	console.log("Refreshing archive list from HTML ...")
-	const $ = await fetchHtml(archivePageUrl)
+	const $ = await fetchContent(archivePageUrl)
 	const items = $(".program")
 	const shows = { ...defaultShows }
 	await async.each(items, async function (item) {
@@ -118,9 +148,10 @@ async function refreshArchiveListFromHtml(archivePageUrl) {
 	return shows
 }
 
+// Reads the list of archives from the XML RSS feed.
 async function refreshArchiveListFromXml(archiveFeedUrl) {
 	console.log("Refreshing archive list from XML ...")
-	const $ = await fetchHtml(archiveFeedUrl)
+	const $ = await fetchContent(archiveFeedUrl)
 	const items = $("item")
 	const shows = { ...defaultShows }
 	await async.each(items, async function (item) {
@@ -150,6 +181,7 @@ async function refreshArchiveListFromXml(archiveFeedUrl) {
 	return shows
 }
 
+// Creates the HTTP server that the Assistant Action will call.
 const server = createServer(async (request, response) => {
 	if (request.method == "GET") {
 		response.writeHead(200, { "Content-Type": "text/html" })
@@ -173,14 +205,20 @@ const server = createServer(async (request, response) => {
 				},
 			}
 			if (params.handler.name == "getArchiveTitles") {
+				// I have told the Action to call "getArchiveTitles" when the intent first
+				// runs, and this returns a list of "expected responses" (show names) for
+				// the Assistant to voice match against. Sadly, it seems to have no effect,
+				// but I'll leave it here for now.
 				conv.expected = {
 					speech: Object.keys(archives),
 				}
 			} else if (params.handler.name == "validateSlots") {
+				// Whatever the user has said, we'll take it.
 				conv.scene = params.scene
 				conv.scene.slotFillingStatus = "FINAL"
 				conv.scene.slots.ArchiveName.status = "FILLED"
 			} else if (params.handler.name == "playArchive") {
+				// OK, here's where we provide the media response to the Assistant.
 				const requestedArchiveName = params.session.params.archiveName.toLowerCase()
 				console.log(`Looking for archive with title ${requestedArchiveName}`)
 				let matchedArchive = archives[requestedArchiveName]
@@ -224,10 +262,12 @@ const server = createServer(async (request, response) => {
 	}
 })
 
+// We will call this function periodically to refresh the archive list.
 const refreshFunction = async () => {
 	const latestArchives = await refreshArchiveListFromXml(archiveFeedUrl)
 	archives = Object.assign({}, archives, latestArchives)
 }
+
 // The archives page lists all shows, but there may be multiples of the same
 // show (e.g. Wake), so it's anyone's guess which one will be in the collection
 // when this function is done.
@@ -239,6 +279,7 @@ await refreshFunction()
 // Now update list from XML feed every 15 mins to keep it fresh.
 const interval = setInterval(refreshFunction, archiveRefreshIntervalMilliseconds)
 
+// Kick off the server.
 const port = process.env.PORT || defaultPort
 console.log(`Woof Moo initializing on port ${port} ...`)
 server.listen(port)
